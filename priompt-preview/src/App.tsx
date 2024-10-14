@@ -1,9 +1,19 @@
-import { useState, useEffect, useCallback, useRef, memo } from "react";
+import {
+  useState,
+  useEffect,
+  useCallback,
+  useRef,
+  memo,
+  useLayoutEffect,
+} from "react";
 import { RenderedPrompt } from "@anysphere/priompt";
-import { streamChat, streamChatCompletion } from "./openai";
+import { streamChatCompletionLocalhost, streamChatLocalhost } from "./openai";
 import { useDebouncedCallback as useDebouncedCallback2 } from "use-debounce";
 import { ChatAndFunctionPromptFunction } from "@anysphere/priompt";
-import { ChatCompletionResponseMessage } from "./openai_interfaces";
+import {
+  ChatCompletionRequestMessage,
+  ChatCompletionResponseMessage,
+} from "./openai_interfaces";
 // import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
 import {
@@ -18,11 +28,160 @@ import { v4 as uuidv4 } from "uuid";
 import {
   ChatPrompt,
   ChatPromptAssistantMessage,
+  ChatPromptMessage,
+  Config,
   FunctionPrompt,
+  ImagePromptContent,
   PromptString,
 } from "@anysphere/priompt/dist/types";
-
+import { Content } from "@anysphere/priompt/dist/openai";
+import { PreviewManagerGetPromptOutputQuery } from "@anysphere/priompt/dist/preview";
 const userId = uuidv4();
+
+function isPlainPrompt(
+  prompt: RenderedPrompt | undefined
+): prompt is PromptString {
+  return typeof prompt === "string" || Array.isArray(prompt);
+}
+function chatPromptToString(prompt: ChatPrompt): string {
+  return prompt.messages
+    .map((message) => {
+      return `<|im_start|>${message.role}<|im_sep|>${message.content}<|im_end|>`;
+    })
+    .join("\n");
+}
+
+function promptToOpenAIChatMessages(
+  prompt: RenderedPrompt
+): Array<ChatCompletionRequestMessage> {
+  if (isPlainPrompt(prompt)) {
+    return [
+      {
+        role: "user",
+        content: promptStringToString(prompt),
+      },
+    ];
+  } else if (isChatPrompt(prompt)) {
+    return prompt.messages.map((msg) => {
+      if (msg.role === "function") {
+        return {
+          role: msg.role,
+          name: msg.name,
+          content: promptStringToString(msg.content),
+        };
+      } else if (msg.role === "tool") {
+        // openai chat messages do not support the tool role... (i think)
+        // so we put it in a system message instead!
+        return {
+          role: "system",
+          name: msg.name,
+          content: promptStringToString(msg.content),
+        };
+      } else if (msg.role === "assistant" && msg.functionCall !== undefined) {
+        return {
+          role: msg.role,
+          content:
+            msg.content !== undefined ? promptStringToString(msg.content) : "", // openai is lying when they say this should not be provided
+          function_call: msg.functionCall,
+        };
+      } else if (msg.role === "assistant") {
+        return {
+          role: msg.role,
+          content:
+            msg.content !== undefined ? promptStringToString(msg.content) : "", // openai is lying when they say this should not be provided
+        };
+      } else if (msg.role === "system") {
+        return {
+          role: msg.role,
+          name: msg.name,
+          content:
+            msg.content !== undefined ? promptStringToString(msg.content) : "", // openai is lying when they say this should not be provided
+        };
+      } else {
+        if (msg.images && msg.images.length > 0) {
+          // We format the content
+          const content: Content[] = [];
+          // First, we add the image
+          content.push(...msg.images);
+          // Then we add the text
+          const textContent =
+            msg.content !== undefined ? promptStringToString(msg.content) : "";
+          content.push({
+            type: "text",
+            text: textContent,
+          });
+          // Import new openai api version to support images
+          return {
+            role: msg.role,
+            content: content,
+            name: "name" in msg ? msg.name : undefined,
+          };
+        } else {
+          return {
+            role: msg.role,
+            content:
+              msg.content !== undefined
+                ? promptStringToString(msg.content)
+                : "",
+            name: "name" in msg ? msg.name : undefined,
+          };
+        }
+      }
+    });
+  }
+  throw new Error(`BUG!! promptToOpenAIChatMessagesgot an invalid prompt`);
+}
+
+function openAIChatMessagesToPrompt(
+  messages: ChatCompletionRequestMessage[]
+): ChatPrompt {
+  return {
+    type: "chat",
+    messages: messages.map((m) => {
+      let c: ChatPromptMessage;
+      if (Array.isArray(m.content)) {
+        if (m.role === "function") {
+          c = {
+            role: "function",
+            to: undefined,
+            content: m.content
+              .map((c) => (c.type === "text" ? c.text : ""))
+              .join(""),
+            name: m.name ?? "",
+          };
+          return c;
+        }
+        c = {
+          role: m.role,
+          to: undefined,
+          content: m.content
+            .map((c) => (c.type === "text" ? c.text : ""))
+            .join(""),
+          images: m.content.filter(
+            (c) => c.type === "image_url"
+          ) as ImagePromptContent[],
+        };
+        return c;
+      } else {
+        if (m.role === "function") {
+          c = {
+            role: "function",
+            to: undefined,
+            content: m.content ?? "",
+            name: m.name ?? "",
+          };
+          return c;
+        }
+        c = {
+          role: m.role,
+          to: undefined,
+          content: m.content ?? "",
+        };
+        return c;
+      }
+    }),
+  };
+}
 
 function promptStringToString(promptString: PromptString): string {
   return Array.isArray(promptString) ? promptString.join("") : promptString;
@@ -61,8 +220,11 @@ function useDebouncedCallback<T extends (...args: A[]) => R, A, R>(
   ) as T;
 }
 
-const ALL_MODELS_STR = "gpt-3.5-turbo,gpt-4,gpt-4-32k";
-const ALL_MODELS = ALL_MODELS_STR.split(",");
+// note: this is configured by either the PRIOMPT_PREVIEW_MODELS env variable or by the "chatModels" key in the --config json file
+const ALL_MODELS_STR = '["gpt-3.5-turbo","gpt-4"]';
+
+const ALL_MODELS: (string | { displayName: string; modelKey: string })[] =
+  JSON.parse(ALL_MODELS_STR);
 const COMPLETION_MODELS_STR = "text-davinci-003,code-davinci-002";
 const COMPLETION_MODELS = COMPLETION_MODELS_STR.split(",");
 
@@ -74,16 +236,21 @@ const App = () => {
     number | null
   >();
   const [selectedPrompt, setSelectedPrompt] = useState("");
+  const [selectedRemotePrompt, setSelectedRemotePrompt] = useState<string>("");
+  const [selectedRequestId, setSelectedRequestId] = useState<string>("");
   const [selectedPropsId, setSelectedPropsId] = useState("");
-  const [tokenCount, setTokenCount] = useState(8192);
+  const [tokenCount, setTokenCount] = useState(32_768);
   const [temperature, setTemperature] = useState(0);
   const [forceFunctionCall, setForceFunctionCall] = useState<
     string | undefined
   >(undefined);
-  const [derivedTokenCount, setDerivedTokenCount] = useState(8192);
+  const [derivedTokenCount, setDerivedTokenCount] = useState(32_768);
   const [tokenCountUsed, setTokenCountUsed] = useState(0);
   const [tokenCountReserved, setTokenCountReserved] = useState(0);
   const [durationMs, setDurationMs] = useState(0);
+  const [promptConfig, setPromptConfig] = useState<Config | undefined>(
+    undefined
+  );
   const [priorityCutoff, setPriorityCutoff] = useState<number | undefined>(
     undefined
   );
@@ -101,7 +268,6 @@ const App = () => {
     >
   >({});
   const [output, setOutput] = useState<string | undefined>(undefined);
-
   const textAreaRefs = useRef<Array<HTMLTextAreaElement | undefined>>(
     Array.from({ length: 1 }).map(() => undefined)
   );
@@ -115,6 +281,8 @@ const App = () => {
     AbortController | undefined
   >(undefined);
   const [forceRerender, setForceRerender] = useState<number>(0);
+
+  const dontAutoload = useRef<boolean>(false);
 
   const getPromptOutput = useCallback(
     (stream: boolean, i: number) => {
@@ -136,20 +304,28 @@ const App = () => {
         function_call: (m as ChatPromptAssistantMessage).functionCall,
       };
 
-      const query = {
+      const body: PreviewManagerGetPromptOutputQuery = {
         tokenLimit: tokenCount,
         promptId: selectedPrompt,
         propsId: selectedPropsId,
         completion: stream ? streamify(x) : x,
         stream,
+        tokenizer: "cl100k_base",
+        shouldBuildSourceMap: false,
       };
 
-      fetch(
-        `http://localhost:3000/priompt/getPromptOutput?${new URLSearchParams({
-          v: JSON.stringify(query),
-        })}`
-      )
+      // You can set the port using the env var PRIOMPT_PREVIEW_SERVER_PORT
+      // which overwrites this text here in priompt-preview/scripts/serve.cjs
+      fetch(`http://localhost:3000/priompt/getPromptOutput`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-ghost-mode": "false",
+        },
+        body: JSON.stringify(body),
+      })
         .then((response) => {
+          console.log(`FETCHED http://localhost:3000/priompt/getPromptOutput`);
           if (!response.ok) {
             throw new Error("Error getting output: " + response.statusText);
           }
@@ -168,6 +344,54 @@ const App = () => {
     [prompt, selectedPrompt, selectedPropsId, tokenCount]
   );
 
+  // we want to make sure this runs before anything else
+  useLayoutEffect(() => {
+    const urlParams = new URLSearchParams(window.location.search);
+    const dontAutoloadParam = urlParams.get("dontAutoload");
+    console.log("DONT AUTOLOAD", dontAutoloadParam);
+    if (dontAutoloadParam) {
+      dontAutoload.current = true;
+    }
+    const jsonlParam = urlParams.get("json");
+
+    if (jsonlParam) {
+      const jsonl = decodeURIComponent(jsonlParam);
+
+      const jsonLine: { messages: Array<ChatCompletionRequestMessage> } =
+        JSON.parse(jsonl);
+
+      // convert to renderoutput
+      const data = {
+        prompt: {
+          type: "chat" as const,
+          messages: jsonLine.messages.map((m) => {
+            return m;
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          }) as any[],
+        },
+        outputHandlers: [],
+        priorityCutoff: 100,
+        streamHandlers: [],
+        tokenCount: 100,
+        tokenizer: "cl100k_base",
+        tokenLimit: 100,
+        tokensReserved: 100,
+        durationMs: 100,
+        config: undefined,
+      };
+      setTokenCountUsed(data.tokenCount);
+      setTokenCountReserved(data.tokensReserved);
+      setPromptConfig(data.config);
+      setDurationMs(data.durationMs);
+      setPriorityCutoff(data.priorityCutoff);
+      setPrompt(data.prompt);
+      setErrorMessage("");
+      setCompletion(undefined);
+      setOutput(undefined);
+      setInJsonMode(true);
+    }
+  }, []);
+
   useEffect(() => {
     const storedSelectedPrompt = localStorage.getItem("selectedPrompt");
     const storedSelectedPropsId = localStorage.getItem("selectedPropsId");
@@ -175,13 +399,27 @@ const App = () => {
     console.log(
       "FETCHING PROMPTS!",
       storedSelectedPrompt,
-      storedSelectedPropsId
+      storedSelectedPropsId,
+      dontAutoload
     );
 
-    fetch(`http://localhost:3000/priompt/getPreviews`)
+    if (dontAutoload.current) {
+      return;
+    }
+
+    fetch(`http://localhost:3000/priompt/getPreviews`, {
+      method: "GET",
+      headers: {
+        "Content-Type": "application/json",
+      },
+    })
       .then((response) => response.json())
       .then((data) => {
-        console.log("GOT RESPONSE", data);
+        if (dontAutoload.current) {
+          return;
+        }
+
+        console.log("GOT Preview RESPONSE", data);
         setPrompts(data);
         const x = Object.keys(data);
         x.sort();
@@ -200,6 +438,7 @@ const App = () => {
         } else {
           setSelectedPrompt(x[ix]);
         }
+        console.log("dontAutoload", dontAutoload);
         console.log("ix", ix);
         console.log("x", x);
         console.log("dumps", data[x[ix]].dumps);
@@ -261,6 +500,168 @@ const App = () => {
     100
   );
 
+  const fetchRemoteRequestId = useCallback(
+    (requestId: string, tokenCount: number) => {
+      // Remove https
+
+      const query = {
+        requestId,
+        modelName: "gpt-4",
+        numTokens: tokenCount.toString(),
+      };
+      console.log(query);
+      const urlParams = new URLSearchParams(query);
+      const fullUrl = `http://localhost:7999/priompt/getRequestDump?${urlParams}`;
+
+      console.log("fetching remote prompt", fullUrl);
+
+      fetch(fullUrl, {
+        method: "GET",
+        headers: {
+          "Content-Type": "application/json",
+          "x-ghost-mode": "false",
+        },
+      })
+        .then((res) => res.json())
+        .then(({ data, completion }) => {
+          console.log("completion", completion);
+          setTokenCountUsed(data.tokenCount);
+          setTokenCountReserved(data.tokensReserved);
+          setPromptConfig(data.config);
+          setDurationMs(data.durationMs);
+          setPriorityCutoff(data.priorityCutoff);
+          // setPrompt(data.prompt);
+          const dataPrompt = data.prompt as
+            | ChatPrompt
+            | (ChatPrompt & FunctionPrompt);
+
+          if ("functions" in dataPrompt) {
+            console.log("setting to this!!!");
+            setPrompt(data.prompt);
+          } else {
+            setPrompt({
+              ...dataPrompt,
+              messages: [
+                ...dataPrompt.messages,
+                {
+                  role: "assistant",
+                  to: undefined,
+                  content: completion,
+                },
+              ],
+            });
+          }
+          // const origPrompt = data.prompt as ChatPrompt;
+          // setPrompt({
+          //   type: "chat",
+          //   messages: [
+          //     ...origPrompt.messages,
+          //     {
+          //       role: "assistant",
+          //       content: completion,
+          //     },
+          //   ],
+          // });
+          setErrorMessage("");
+          setCompletion(undefined);
+          setOutput(undefined);
+          setForceRerender((r) => r + 1);
+        })
+        .catch((error) => {
+          setErrorMessage(error.message);
+          setPrompt(undefined);
+          setCompletion(undefined);
+          setOutput(undefined);
+        });
+    },
+    []
+  );
+  const fetchRemotePrompt = useCallback(
+    (promptUrl: string, tokenCount: number) => {
+      // Remove https
+      const remaining = promptUrl.split("://")[1];
+
+      // Parse the s3 aws url into a bucket and key
+      const bucket = remaining.split(".")[0];
+
+      const firstSlash = remaining.indexOf("/");
+
+      const key = remaining.slice(firstSlash + 1);
+
+      const query = {
+        bucket,
+        key,
+        modelName: "gpt-4",
+        numTokens: tokenCount.toString(),
+      };
+      console.log(query);
+      const urlParams = new URLSearchParams(query);
+      const fullUrl = `http://localhost:7999/priompt/getDump?${urlParams}`;
+
+      console.log("fetching remote prompt", fullUrl);
+
+      fetch(fullUrl, {
+        method: "GET",
+        headers: {
+          "Content-Type": "application/json",
+          "x-ghost-mode": "false",
+        },
+      })
+        .then((res) => res.json())
+        .then(({ data, completion }) => {
+          console.log("completion", completion);
+          setTokenCountUsed(data.tokenCount);
+          setTokenCountReserved(data.tokensReserved);
+          setPromptConfig(data.config);
+          setDurationMs(data.durationMs);
+          setPriorityCutoff(data.priorityCutoff);
+          // setPrompt(data.prompt);
+          const dataPrompt = data.prompt as
+            | ChatPrompt
+            | (ChatPrompt & FunctionPrompt);
+
+          if ("functions" in dataPrompt) {
+            console.log("setting to this!!!");
+            setPrompt(data.prompt);
+          } else {
+            setPrompt({
+              ...dataPrompt,
+              messages: [
+                ...dataPrompt.messages,
+                {
+                  role: "assistant",
+                  to: undefined,
+                  content: completion,
+                },
+              ],
+            });
+          }
+          // const origPrompt = data.prompt as ChatPrompt;
+          // setPrompt({
+          //   type: "chat",
+          //   messages: [
+          //     ...origPrompt.messages,
+          //     {
+          //       role: "assistant",
+          //       content: completion,
+          //     },
+          //   ],
+          // });
+          setErrorMessage("");
+          setCompletion(undefined);
+          setOutput(undefined);
+          setForceRerender((r) => r + 1);
+        })
+        .catch((error) => {
+          setErrorMessage(error.message);
+          setPrompt(undefined);
+          setCompletion(undefined);
+          setOutput(undefined);
+        });
+    },
+    []
+  );
+
   const fetchPrompt = useCallback(
     (promptId: string, propsId: string, tokenCount: number) => {
       console.log("fetching prompt", promptId, propsId, tokenCount);
@@ -268,6 +669,8 @@ const App = () => {
         promptId,
         propsId,
         tokenLimit: tokenCount.toString(),
+        shouldBuildSourceMap: String(true),
+        tokenizer: "cl100k_base",
       };
 
       if (promptId === "liveModePromptId" && propsId === "") {
@@ -283,6 +686,7 @@ const App = () => {
         `http://localhost:3000/priompt/getPrompt?${new URLSearchParams(query)}`
       )
         .then((response) => {
+          console.log("FETCHED priompt/getPrompt");
           if (!response.ok) {
             throw new Error("Error fetching prompt: " + response.statusText);
           }
@@ -291,6 +695,7 @@ const App = () => {
         .then((data) => {
           setTokenCountUsed(data.tokenCount);
           setTokenCountReserved(data.tokensReserved);
+          setPromptConfig(data.config);
           setDurationMs(data.durationMs);
           setPriorityCutoff(data.priorityCutoff);
           setPrompt(data.prompt);
@@ -308,79 +713,193 @@ const App = () => {
     []
   );
 
+  const [inJsonMode, setInJsonMode] = useState<boolean>(false);
+  const [dontDisplayExtras, setDontDisplayExtras] = useState<boolean>(false);
+  const [lastPassedInModel, setLastPassedInModel] = useState<
+    | {
+        displayName: string;
+        modelKey: string;
+      }
+    | undefined
+  >(undefined);
+
   useEffect(() => {
-    if (selectedPrompt) {
-      console.log("FETCHING PROMPT IN 156 use effect");
-      fetchPrompt(selectedPrompt, selectedPropsId, derivedTokenCount);
-    }
-  }, [selectedPrompt, fetchPrompt, selectedPropsId, derivedTokenCount]);
+    window.addEventListener("message", (event) => {
+      const t:
+        | {
+            case: "messages";
+            messages: ChatCompletionRequestMessage[];
+          }
+        | {
+            case: "s3Url";
+            s3Url: string;
+          }
+        | {
+            case: "model";
+            model: {
+              displayName: string;
+              modelKey: string;
+            };
+          } = event.data;
+
+      console.log("GOT MESSAGE", t);
+
+      switch (t.case) {
+        case "messages": {
+          const jsonLine: Array<ChatCompletionRequestMessage> = t.messages;
+
+          // convert to renderoutput
+          const data = {
+            prompt: {
+              type: "chat" as const,
+              messages: openAIChatMessagesToPrompt(jsonLine).messages,
+            },
+            outputHandlers: [],
+            priorityCutoff: 100,
+            streamHandlers: [],
+            tokenCount: 100,
+            tokenizer: "cl100k_base",
+            tokenLimit: 100,
+            tokensReserved: 100,
+            durationMs: 100,
+            config: undefined,
+          };
+          setTokenCountUsed(data.tokenCount);
+          setTokenCountReserved(data.tokensReserved);
+          setPromptConfig(data.config);
+          setDurationMs(data.durationMs);
+          setPriorityCutoff(data.priorityCutoff);
+          setPrompt(data.prompt);
+          setErrorMessage("");
+          setCompletion(undefined);
+          setOutput(undefined);
+          setInJsonMode(true);
+          setDontDisplayExtras(true);
+          setForceRerender((r) => r + 1);
+          break;
+        }
+        case "s3Url": {
+          const s3 = t.s3Url;
+
+          setSelectedPrompt("");
+          setSelectedRemotePrompt(s3);
+          setDontDisplayExtras(true);
+          break;
+        }
+        case "model": {
+          const model = t.model;
+          console.log("[Got New Model]", model);
+          setLastPassedInModel(model);
+          break;
+        }
+      }
+    });
+  }, []);
+
+  const fetchJsonL = useCallback((path: string, index: number) => {
+    console.log("fetching jsonL", path, index);
+    const query = {
+      path,
+      index: `${index}`,
+    };
+
+    fetch(
+      `http://localhost:7999/priompt/displayJSONL?${new URLSearchParams(query)}`
+    )
+      .then((response) => {
+        if (!response.ok) {
+          throw new Error("Error fetching jsoonL: " + response.statusText);
+        }
+        return response.json().then((arr) => arr[0]);
+      })
+      .then((data) => {
+        setTokenCountUsed(data.tokenCount);
+        setTokenCountReserved(data.tokensReserved);
+        setPromptConfig(data.config);
+        setDurationMs(data.durationMs);
+        setPriorityCutoff(data.priorityCutoff);
+        setPrompt(data.prompt);
+        setErrorMessage("");
+        setCompletion(undefined);
+        setOutput(undefined);
+        setForceRerender((r) => r + 1);
+      })
+      .catch((error) => {
+        setErrorMessage(error.message);
+        setPrompt(undefined);
+        setCompletion(undefined);
+        setOutput(undefined);
+      });
+  }, []);
 
   // Add event listener for keydown events
-  useEffect(() => {
-    const handleKeyDown = (event: KeyboardEvent) => {
-      const key = event.key;
-      // console.log(event._stopPropagation);
-      // If the textarea is focused, stop propagation of the event
-      if (
-        document.activeElement?.id &&
-        document.activeElement.id.includes("prompt-textarea")
-      ) {
-        return;
-      }
+  // removed because they interfere with input boxes
+  // and also never really that useful imo?
+  // useEffect(() => {
+  //   const handleKeyDown = (event: KeyboardEvent) => {
+  //     const key = event.key;
+  //     // console.log(event._stopPropagation);
+  //     // If the textarea is focused, stop propagation of the event
+  //     if (
+  //       document.activeElement?.id &&
+  //       document.activeElement.id.includes("prompt-textarea")
+  //     ) {
+  //       return;
+  //     }
 
-      // Press "r" to reload (fetchPrompt again)
-      if (key === "r") {
-        fetchPrompt(selectedPrompt, selectedPropsId, tokenCount);
-      }
+  //     // Press "r" to reload (fetchPrompt again)
+  //     if (key === "r") {
+  //       fetchPrompt(selectedPrompt, selectedPropsId, tokenCount);
+  //     }
 
-      const slider = document.getElementById(
-        "token-count-slider"
-      ) as HTMLInputElement;
+  //     const slider = document.getElementById(
+  //       "token-count-slider"
+  //     ) as HTMLInputElement;
 
-      // Press shift-left and shift-right arrows to advance the slider by 128
-      const shiftStep = 128;
-      if (event.shiftKey && key === "ArrowLeft") {
-        slider.value = Math.max(
-          parseInt(slider.value) - shiftStep,
-          parseInt(slider.min)
-        ).toString();
-        setTokenCount(parseInt(slider.value));
-      } else if (event.shiftKey && key === "ArrowRight") {
-        slider.value = Math.min(
-          parseInt(slider.value) + shiftStep,
-          parseInt(slider.max)
-        ).toString();
-        setTokenCount(parseInt(slider.value));
-      }
+  //     // Press shift-left and shift-right arrows to advance the slider by 128
+  //     const shiftStep = 128;
+  //     if (event.shiftKey && key === "ArrowLeft") {
+  //       slider.value = Math.max(
+  //         parseInt(slider.value) - shiftStep,
+  //         parseInt(slider.min)
+  //       ).toString();
+  //       setTokenCount(parseInt(slider.value));
+  //     } else if (event.shiftKey && key === "ArrowRight") {
+  //       slider.value = Math.min(
+  //         parseInt(slider.value) + shiftStep,
+  //         parseInt(slider.max)
+  //       ).toString();
+  //       setTokenCount(parseInt(slider.value));
+  //     }
 
-      // Press left-right arrows to advance the slider left and right
-      const step = 1; // Change this value to adjust the step size
-      if (key === "ArrowLeft") {
-        slider.value = Math.max(
-          parseInt(slider.value) - step,
-          parseInt(slider.min)
-        ).toString();
-        setTokenCount(parseInt(slider.value));
-      } else if (key === "ArrowRight") {
-        slider.value = Math.min(
-          parseInt(slider.value) + step,
-          parseInt(slider.max)
-        ).toString();
-        setTokenCount(parseInt(slider.value));
-      }
+  //     // Press left-right arrows to advance the slider left and right
+  //     const step = 1; // Change this value to adjust the step size
+  //     if (key === "ArrowLeft") {
+  //       slider.value = Math.max(
+  //         parseInt(slider.value) - step,
+  //         parseInt(slider.min)
+  //       ).toString();
+  //       setTokenCount(parseInt(slider.value));
+  //     } else if (key === "ArrowRight") {
+  //       slider.value = Math.min(
+  //         parseInt(slider.value) + step,
+  //         parseInt(slider.max)
+  //       ).toString();
+  //       setTokenCount(parseInt(slider.value));
+  //     }
 
-      if (key >= "1" && key <= "9") {
-        const digit = parseInt(key);
-        const tokenCount = Math.round((digit * 1000) / 1024) * 1024;
-        setTokenCount(tokenCount);
-      }
-    };
+  //     if (key >= "1" && key <= "9") {
+  //       const digit = parseInt(key);
+  //       const tokenCount = Math.round((digit * 1000) / 1024) * 1024;
+  //       setTokenCount(tokenCount);
+  //     }
+  //   };
 
-    window.addEventListener("keydown", handleKeyDown);
-    return () => {
-      window.removeEventListener("keydown", handleKeyDown);
-    };
-  }, [selectedPrompt, selectedPropsId, tokenCount, fetchPrompt]);
+  //   window.addEventListener("keydown", handleKeyDown);
+  //   return () => {
+  //     window.removeEventListener("keydown", handleKeyDown);
+  //   };
+  // }, [selectedPrompt, selectedPropsId, tokenCount, fetchPrompt]);
 
   const handleSelectPrompt = useCallback(
     (promptId: string) => {
@@ -421,6 +940,7 @@ const App = () => {
       `http://localhost:3000/priompt/liveMode?${new URLSearchParams(query)}`
     )
       .then((response) => {
+        console.log("FETCHED priompt/liveMode");
         if (!response.ok) {
           throw new Error("Error fetching live mode: " + response.statusText);
         }
@@ -487,6 +1007,7 @@ const App = () => {
               {
                 role: "assistant",
                 content: "",
+                to: undefined,
                 functionCall: undefined,
               },
               ...prev.messages.slice(i),
@@ -520,7 +1041,10 @@ const App = () => {
         setTimeToFirstToken(undefined);
         setTimeToRemainingTokens(undefined);
         const f =
-          options?.completionModel === true ? streamChatCompletion : streamChat;
+          options?.completionModel === true
+            ? streamChatCompletionLocalhost
+            : streamChatLocalhost;
+
         const stream = f(
           {
             model,
@@ -531,25 +1055,51 @@ const App = () => {
                   return {
                     role: m.role,
                     name: m.name,
-                    content: m.content
-                      ? promptStringToString(m.content)
-                      : undefined,
+                    content: m.content ? promptStringToString(m.content) : "",
                   };
                 } else if (m.role === "assistant" && m.functionCall) {
                   return {
                     role: m.role,
                     function_call: m.functionCall,
-                    content: m.content
-                      ? promptStringToString(m.content)
-                      : undefined,
+                    content: m.content ? promptStringToString(m.content) : "",
                   };
-                } else {
+                } else if (m.role === "assistant" || m.role === "system") {
                   return {
                     role: m.role,
-                    content: m.content
-                      ? promptStringToString(m.content)
-                      : undefined,
+                    content: m.content ? promptStringToString(m.content) : "",
                   };
+                } else if (m.role === "user") {
+                  if (m.images) {
+                    const rawText = m.content
+                      ? promptStringToString(m.content)
+                      : "";
+                    const textContent: Content = {
+                      type: "text",
+                      text: rawText,
+                    };
+                    const images: Content[] = m.images.map((image) => {
+                      return {
+                        ...image,
+                        image_url: {
+                          url: image.image_url.url,
+                          detail: image.image_url.detail,
+                          // dimensions: image.image_url.dimensions,
+                        },
+                        // Hack to get around the dimensions hack
+                      } as Content;
+                    });
+                    return {
+                      role: m.role,
+                      content: [textContent, ...images],
+                    };
+                  } else {
+                    return {
+                      role: m.role,
+                      content: m.content ? promptStringToString(m.content) : "",
+                    };
+                  }
+                } else {
+                  throw new Error("unknown role");
                 }
               }),
             temperature,
@@ -560,6 +1110,7 @@ const App = () => {
               functions.some((f) => f.name === forceFunctionCall)
                 ? { name: forceFunctionCall }
                 : undefined,
+            ...(model.includes("vision") ? { max_tokens: 500 } : {}),
             user: userId,
           },
           undefined,
@@ -589,6 +1140,7 @@ const App = () => {
                   {
                     role: "assistant",
                     content: text,
+                    to: undefined,
                     functionCall:
                       function_call !== undefined
                         ? {
@@ -614,7 +1166,7 @@ const App = () => {
                         text !== undefined || c?.content !== undefined
                           ? (c?.content ?? "") + (text ?? "")
                           : undefined,
-                      function_call:
+                      functionCall:
                         c?.functionCall !== undefined ||
                         function_call !== undefined
                           ? {
@@ -695,6 +1247,45 @@ const App = () => {
 
   const [filterText, setFilterText] = useState("");
 
+  useEffect(() => {
+    if (inJsonMode) return;
+    if (selectedPrompt) {
+      fetchPrompt(selectedPrompt, selectedPropsId, derivedTokenCount);
+    } else if (selectedRemotePrompt) {
+      fetchRemotePrompt(selectedRemotePrompt, derivedTokenCount);
+    } else if (selectedRequestId) {
+      fetchRemoteRequestId(selectedRequestId, derivedTokenCount);
+    }
+  }, [
+    inJsonMode,
+    selectedPrompt,
+    selectedRemotePrompt,
+    selectedRequestId,
+    fetchPrompt,
+    fetchRemotePrompt,
+    fetchRemoteRequestId,
+    selectedPropsId,
+    derivedTokenCount,
+  ]);
+
+  // Support auto-loading from ?requestId=...
+  const reqIdInSearchParams = new URLSearchParams(window.location.search).get(
+    "requestId"
+  );
+
+  const [requestId, setRequestId] = useState(
+    Array.isArray(reqIdInSearchParams)
+      ? reqIdInSearchParams[0]
+      : reqIdInSearchParams ?? ""
+  );
+
+  useEffect(() => {
+    const button = document.getElementById("fetch-request-id");
+    if (button && requestId.length > 0) {
+      button.click();
+    }
+  });
+
   return (
     <>
       <CommandMenu
@@ -704,115 +1295,222 @@ const App = () => {
         }))}
       />
       <div>
-        <h1>Welcome to Priompt</h1>
-        <div>
-          <b>r</b> to reload, <b>left</b> and <b>right</b> arrows to adjust
-          token count, <b>shift-left</b> and <b>shift-right</b> arrows to adjust
-          token count by 128.
-          <div className="text-blue-800">
-            new feature: cmd+k to open the command menu and quickly switch
-            prompts.
-          </div>
-        </div>
-        <br />
-        <input
-          type="text"
-          value={filterText}
-          onChange={(e) => setFilterText(e.target.value)}
-          placeholder="Filter prompts"
-        />
-        <div
-          style={{
-            display: "flex",
-            flexWrap: "wrap",
-            flexDirection: "row",
-            gap: "6px",
-            maxWidth: "100%",
-            overflowX: "auto",
-            padding: "1rem 0",
-          }}
-        >
-          <Button
-            className="tab border-none h-8 whitespace-nowrap"
-            onClick={() => handleSelectPrompt("liveModePromptId")}
-            variant={
-              "liveModePromptId" === selectedPrompt ? "ghost" : "outline"
-            }
-            style={{
-              border:
-                "liveModePromptId" === selectedPrompt
-                  ? "1px solid black"
-                  : "none",
-              cursor: "pointer",
-            }}
-          >
-            live mode
-          </Button>
-          {promptsls
-            .filter((prompt) =>
-              prompt.toLowerCase().includes(filterText.toLowerCase())
-            )
-            .map((prompt) => (
+        {!dontDisplayExtras && (
+          <div>
+            <h1>Welcome to Priompt</h1>
+            <div>
+              <b>r</b> to reload, <b>left</b> and <b>right</b> arrows to adjust
+              token count, <b>shift-left</b> and <b>shift-right</b> arrows to
+              adjust token count by 128.
+              <div className="text-blue-800">
+                new feature: cmd+k to open the command menu and quickly switch
+                prompts.
+              </div>
+            </div>
+            <br />
+            <form
+              onSubmit={(e: React.FormEvent<HTMLFormElement>) => {
+                e.preventDefault();
+                const currentText = (e.currentTarget[0] as HTMLInputElement)
+                  .value;
+                setSelectedPrompt("");
+                setSelectedRemotePrompt(currentText);
+                setSelectedRequestId("");
+              }}
+            >
+              <input
+                type="text"
+                style={{
+                  width: "500px",
+                }}
+                placeholder="Enter remote prompt URL"
+              />
+              <button type="submit">Fetch Remote Prompt</button>
+            </form>
+            <form
+              onSubmit={(e: React.FormEvent<HTMLFormElement>) => {
+                e.preventDefault();
+                const currentText = (e.currentTarget[0] as HTMLInputElement)
+                  .value;
+                setSelectedPrompt("");
+                setSelectedRemotePrompt("");
+                console.log("set request id");
+                setSelectedRequestId(currentText);
+              }}
+            >
+              <input
+                type="text"
+                style={{
+                  width: "500px",
+                }}
+                value={requestId}
+                placeholder="Enter request id"
+                onChange={(e) => setRequestId(e.target.value)}
+              />
+              <button id="fetch-request-id" type="submit">
+                Fetch Request Id
+              </button>
+            </form>
+            <form
+              onSubmit={(e: React.FormEvent<HTMLFormElement>) => {
+                e.preventDefault();
+                const currentText = (e.currentTarget[0] as HTMLInputElement)
+                  .value;
+                setSelectedPrompt("");
+                setSelectedRemotePrompt("");
+                setSelectedRequestId("");
+                const currentIndex = (e.currentTarget[1] as HTMLInputElement)
+                  .valueAsNumber;
+                fetchJsonL(currentText, currentIndex);
+              }}
+            >
+              <input
+                style={{
+                  width: "500px",
+                }}
+                type="text"
+                placeholder="Enter JSONL path"
+              />
+              <input type="number" defaultValue={0} />
+              <button type="submit">Fetch local JSONL</button>
+            </form>
+            <input
+              type="text"
+              value={filterText}
+              onChange={(e) => setFilterText(e.target.value)}
+              placeholder="Filter prompts"
+            />
+            <div
+              style={{
+                display: "flex",
+                flexWrap: "wrap",
+                flexDirection: "row",
+                gap: "6px",
+                maxWidth: "100%",
+                overflowX: "auto",
+                padding: "1rem 0",
+              }}
+            >
               <Button
-                variant={prompt === selectedPrompt ? "ghost" : "outline"}
-                key={prompt}
-                className="tab border-none outline-none shadow-none h-8"
-                onClick={() => handleSelectPrompt(prompt)}
+                className="tab border-none h-8 whitespace-nowrap"
+                onClick={() => handleSelectPrompt("liveModePromptId")}
+                variant={
+                  "liveModePromptId" === selectedPrompt ? "ghost" : "outline"
+                }
                 style={{
                   border:
-                    prompt === selectedPrompt ? "1px solid black" : "none",
+                    "liveModePromptId" === selectedPrompt
+                      ? "1px solid black"
+                      : "none",
                   cursor: "pointer",
                 }}
               >
-                {prompt}
+                live mode
               </Button>
-            ))}
-        </div>
-        <PropsSelector
-          prompt={prompts[selectedPrompt]}
-          selectedPropsId={selectedPropsId}
-          setSelectedPropsId={setSelectedPropsId}
-        />
-        <div>
-          <label htmlFor="token-count-slider">
-            Token count: <span>{tokenCount}</span>
-          </label>
-          <button onClick={() => setTokenCount(4096)}>4096 (press 4)</button>
-          <button onClick={() => setTokenCount(8192)}>8192 (press 8)</button>
-          <br />
-          <input
-            type="range"
-            id="token-count-slider"
-            min="1"
-            max="32768"
-            value={tokenCount}
-            onChange={handleTokenCountChange}
-            style={{
-              width: "100%",
-            }}
-          />
-        </div>
-        <div>
-          Used tokens: {tokenCountUsed} ({tokenCountReserved} reserved for
-          generation, {priorityCutoff} cutoff)
-          <button
-            onClick={() => {
-              fetchPrompt(selectedPrompt, selectedPropsId, tokenCount);
-            }}
-          >
-            rerender
-          </button>
-        </div>
-        <div>
-          Render time: {durationMs}ms (don't trust too much because caching)
-        </div>
-        <div>
-          {/* we should ideally make this generic, but that's a tiny bit annoying */}
-          Prompt dump file name:{" "}
-          <code style={{ userSelect: "all" }}>
-            backend/server/priompt/{selectedPrompt}/dumps/{selectedPropsId}.yaml
-          </code>
-        </div>
+              {promptsls
+                .filter((prompt) =>
+                  prompt.toLowerCase().includes(filterText.toLowerCase())
+                )
+                .map((prompt) => (
+                  <Button
+                    variant={prompt === selectedPrompt ? "ghost" : "outline"}
+                    key={prompt}
+                    className="tab border-none outline-none shadow-none h-8"
+                    onClick={() => handleSelectPrompt(prompt)}
+                    style={{
+                      border:
+                        prompt === selectedPrompt ? "1px solid black" : "none",
+                      cursor: "pointer",
+                    }}
+                  >
+                    {prompt}
+                  </Button>
+                ))}
+            </div>
+            <PropsSelector
+              prompt={prompts[selectedPrompt]}
+              selectedPropsId={selectedPropsId}
+              setSelectedPropsId={setSelectedPropsId}
+            />
+            <div>
+              <label htmlFor="token-count-slider">
+                Token count: <span>{tokenCount}</span>
+              </label>
+              <button onClick={() => setTokenCount(4096)}>
+                4096 (press 4)
+              </button>
+              <button onClick={() => setTokenCount(8192)}>
+                8192 (press 8)
+              </button>
+              <button onClick={() => setTokenCount(150_000)}>150,000</button>
+              <button onClick={() => setTokenCount(200_000)}>200,000</button>
+              <button onClick={() => setTokenCount(1_000_000)}>
+                1,000,000
+              </button>
+              <br />
+              <input
+                type="range"
+                id="token-count-slider"
+                min="1"
+                max="1000000"
+                value={tokenCount}
+                onChange={handleTokenCountChange}
+                style={{
+                  width: "100%",
+                }}
+              />
+            </div>
+            <div>
+              Used tokens: {tokenCountUsed} ({tokenCountReserved} reserved for
+              generation, {priorityCutoff} cutoff)
+              <button
+                onClick={() => {
+                  if (selectedPrompt) {
+                    fetchPrompt(selectedPrompt, selectedPropsId, tokenCount);
+                  } else if (selectedRemotePrompt) {
+                    fetchRemotePrompt(selectedRemotePrompt, tokenCount);
+                  } else if (selectedRequestId) {
+                    fetchRemoteRequestId(selectedRequestId, tokenCount);
+                  }
+                }}
+              >
+                rerender
+              </button>
+            </div>
+            <div>
+              Render time: {durationMs}ms (don't trust too much because caching)
+            </div>
+            <div>
+              Stop token(s):{" "}
+              <code
+                style={{
+                  backgroundColor: "lightgrey",
+                }}
+              >
+                {promptConfig?.stop
+                  ? JSON.stringify(promptConfig?.stop)
+                  : "(not set)"}
+              </code>
+              . Max response tokens:{" "}
+              <code
+                style={{
+                  backgroundColor: "lightgrey",
+                }}
+              >
+                {promptConfig?.maxResponseTokens ?? "(not set)"}
+              </code>
+              .
+            </div>
+            <div>
+              {/* we should ideally make this generic, but that's a tiny bit annoying */}
+              Prompt dump file name:{" "}
+              <code style={{ userSelect: "all" }}>
+                backend/server/priompt/{selectedPrompt}/dumps/{selectedPropsId}
+                .yaml
+              </code>
+            </div>
+          </div>
+        )}
         {errorMessage.length > 0 && (
           <>
             <div
@@ -845,7 +1543,6 @@ const App = () => {
               <>
                 {prompt.messages.map((msg, i) => {
                   const key = `${i}-${forceRerender}`;
-                  console.log("rendering message", key);
                   return (
                     <>
                       {msg.role === "assistant" ? (
@@ -875,6 +1572,9 @@ const App = () => {
                           setFullText={(newText: string) => {
                             debouncedSetFullPrompts(i, newText);
                           }}
+                          extraModels={
+                            lastPassedInModel ? [lastPassedInModel] : []
+                          }
                         />
                       ) : (
                         <>
@@ -894,6 +1594,27 @@ const App = () => {
                             <b>{msg.role}</b>
                             {msg.role === "function" && <i>: {msg.name}</i>}
                             <br />
+                            {msg.role === "user" && msg.images && (
+                              <div
+                                style={{
+                                  maxHeight: "100%",
+                                  maxWidth: "100%",
+                                  padding: "2rem",
+                                }}
+                              >
+                                {msg.images.map((image) => {
+                                  return (
+                                    <img
+                                      src={image.image_url.url}
+                                      style={{
+                                        maxHeight: "100%",
+                                        maxWidth: "100%",
+                                      }}
+                                    />
+                                  );
+                                })}
+                              </div>
+                            )}
                             <TextAreaWithSetting
                               key={key}
                               realKey={key}
@@ -938,6 +1659,9 @@ const App = () => {
                               setFullText={(_: string) => {
                                 // intentionally empty
                               }}
+                              extraModels={
+                                lastPassedInModel ? [lastPassedInModel] : []
+                              }
                             />
                           )}
                         </>
@@ -958,6 +1682,7 @@ const App = () => {
                   ...prev.messages,
                   {
                     role: "user",
+                    to: undefined,
                     content: "New user message",
                   },
                 ],
@@ -977,6 +1702,7 @@ const App = () => {
                   ...prev.messages,
                   {
                     role: "system",
+                    to: undefined,
                     content: "New system message",
                   },
                 ],
@@ -996,6 +1722,7 @@ const App = () => {
                   ...prev.messages,
                   {
                     role: "assistant",
+                    to: undefined,
                     content: "New assistant message",
                   },
                 ],
@@ -1005,6 +1732,47 @@ const App = () => {
         >
           Add Assistant Message
         </button>
+        {prompt && (
+          <div>
+            <button
+              onClick={() => {
+                const msgs = promptToOpenAIChatMessages(prompt);
+                const stringified = JSON.stringify(msgs, null, 2);
+                navigator.clipboard
+                  .writeText(stringified)
+                  .then(() => {
+                    console.log("Prompt JSON copied to clipboard");
+                  })
+                  .catch((err) => {
+                    console.error(
+                      "Failed to copy prompt JSON to clipboard",
+                      err
+                    );
+                  });
+              }}
+            >
+              Copy prompt as messages JSON
+            </button>
+            <button
+              onClick={() => {
+                const s = chatPromptToString(prompt);
+                navigator.clipboard
+                  .writeText(s)
+                  .then(() => {
+                    console.log("Prompt string copied to clipboard");
+                  })
+                  .catch((err) => {
+                    console.error(
+                      "Failed to copy prompt string to clipboard",
+                      err
+                    );
+                  });
+              }}
+            >
+              Copy prompt as completion prompt string
+            </button>
+          </div>
+        )}
 
         {selectedPrompt === "liveModePromptId" && selectedPropsId !== "" && (
           <div>
@@ -1042,6 +1810,7 @@ const App = () => {
                   )}`
                 )
                   .then((response) => {
+                    console.log("FETCHED priompt/liveModeResult");
                     if (!response.ok) {
                       throw new Error(
                         "Error submitting live mode result: " +
@@ -1088,6 +1857,7 @@ const App = () => {
                     )}`
                   )
                     .then((response) => {
+                      console.log("FETCHED priompt/liveModeResult");
                       if (!response.ok) {
                         throw new Error(
                           "Error submitting live mode result: " +
@@ -1116,7 +1886,7 @@ const App = () => {
         )}
         <div
           style={{
-            height: "400px",
+            height: "50px",
             opacity: 0,
           }}
         >
@@ -1186,13 +1956,64 @@ const TextAreaWithSetting = memo(
   }) => {
     const [prevScrollPos, setPrevScrollPos] = useState(0);
     const [scrollCorrection, setScrollCorrection] = useState(false);
+    const [isMinimized, setIsMinimized] = useState(false);
 
     const internalRef = useRef<HTMLTextAreaElement>(null);
+
+    const updateHeight = () => {
+      if (internalRef.current === null) return;
+      // Create a hidden clone of the textarea
+      const clone = internalRef.current.cloneNode() as HTMLTextAreaElement;
+      clone.style.visibility = "hidden";
+      clone.style.position = "absolute";
+      clone.style.height = "auto";
+      clone.style.whiteSpace = "pre-wrap";
+      clone.style.border = "solid 1px rgba(0,0,0,0)";
+      clone.style.boxSizing = "border-box";
+      clone.style.width = "100%";
+      clone.style.display = "block";
+      clone.style.resize = "none";
+      clone.style.outline = "none";
+      // document.body.appendChild(clone);
+      // append to the parent of the internalRef!
+      const appendNode = internalRef.current.parentNode ?? document.body;
+      appendNode.appendChild(clone);
+
+      // Copy the content to the clone
+      clone.value = internalRef.current.value ?? "";
+
+      // Measure the scrollHeight of the clone
+      const scrollHeight = clone.scrollHeight;
+
+      // Remove the clone
+      appendNode.removeChild(clone);
+
+      // Adjust the height of the original textarea
+      internalRef.current.style.height = `${scrollHeight + 5}px`;
+
+      // Store the current scroll position
+      // const scrollTop = internalRef.current.scrollTop;
+      // const h = internalRef.current.scrollHeight;
+
+      // resize the textarea to fit the content
+      // internalRef.current.style.height = `${internalRef.current.scrollHeight}px`;
+
+      // Restore the scroll position
+      // internalRef.current.scrollTop = scrollTop;
+      // update the scroll!
+      if (internalRef.current !== null) {
+        internalRef.current.scrollTop = prevScrollPos;
+      }
+    };
 
     useEffect(() => {
       if (internalRef.current !== null) {
         props.setTextArea(internalRef.current);
+        setTimeout(() => {
+          updateHeight();
+        }, 10);
       }
+      // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [props]);
 
     const handleScroll: React.UIEventHandler<HTMLTextAreaElement> = (event) => {
@@ -1210,39 +2031,7 @@ const TextAreaWithSetting = memo(
       props.setFullText(e.target.value ?? "");
       if (internalRef.current !== null) {
         internalRef.current.value = e.target.value ?? "";
-
-        // Create a hidden clone of the textarea
-        const clone = internalRef.current.cloneNode() as HTMLTextAreaElement;
-        clone.style.visibility = "hidden";
-        clone.style.position = "absolute";
-        clone.style.height = "auto";
-        document.body.appendChild(clone);
-
-        // Copy the content to the clone
-        clone.value = e.target.value ?? "";
-
-        // Measure the scrollHeight of the clone
-        const scrollHeight = clone.scrollHeight;
-
-        // Remove the clone
-        document.body.removeChild(clone);
-
-        // Adjust the height of the original textarea
-        internalRef.current.style.height = `${scrollHeight}px`;
-
-        // Store the current scroll position
-        // const scrollTop = internalRef.current.scrollTop;
-        // const h = internalRef.current.scrollHeight;
-
-        // resize the textarea to fit the content
-        // internalRef.current.style.height = `${internalRef.current.scrollHeight}px`;
-
-        // Restore the scroll position
-        // internalRef.current.scrollTop = scrollTop;
-      }
-      // update the scroll!
-      if (internalRef.current !== null) {
-        internalRef.current.scrollTop = prevScrollPos;
+        updateHeight();
       }
     };
 
@@ -1253,32 +2042,56 @@ const TextAreaWithSetting = memo(
     };
 
     return (
-      <textarea
-        ref={internalRef}
-        id={`prompt-textarea-${props.realKey}`}
+      <div
         style={{
-          whiteSpace: "pre-wrap",
           width: "100%",
-          outline: "none",
-          resize: "none",
-          display: "block",
-          // remove the border from the textarea
-          border: "solid 1px",
-          // background completely transparent
-          backgroundColor: "rgba(0,0,0,0)",
-          boxSizing: "border-box",
-          ...props.style,
+          position: "relative",
         }}
-        onKeyDown={(e) => {
-          // Capture all keydown events
-          e.stopPropagation();
-        }}
-        onChange={handleInput}
-        spellCheck={false}
-        onScroll={handleScroll}
-        onFocus={onFocus}
-        onClick={onFocus}
-      />
+      >
+        <textarea
+          ref={internalRef}
+          id={`prompt-textarea-${props.realKey}`}
+          style={{
+            whiteSpace: "pre-wrap",
+            width: "100%",
+            outline: "none",
+            resize: "none",
+            display: isMinimized ? "none" : "block",
+            // remove the border from the textarea
+            border: "solid 1px",
+            // background completely transparent
+            backgroundColor: "rgba(0,0,0,0)",
+            boxSizing: "border-box",
+            ...props.style,
+          }}
+          onKeyDown={(e) => {
+            // Capture all keydown events
+            e.stopPropagation();
+            // if it's cmd+escape, minimize
+            if (e.key === "Escape" && e.metaKey) {
+              setIsMinimized(true);
+            }
+          }}
+          onChange={handleInput}
+          spellCheck={false}
+          autoComplete="off"
+          onScroll={handleScroll}
+          onFocus={onFocus}
+          onClick={onFocus}
+        />
+        {isMinimized ? (
+          <>
+            <button
+              style={{
+                margin: "10px",
+              }}
+              onClick={() => setIsMinimized(false)}
+            >
+              Minimized. Click to unminimize
+            </button>
+          </>
+        ) : null}
+      </div>
     );
   },
   (prevProps, nextProps) => {
@@ -1619,21 +2432,85 @@ function AssistantBox(props: {
   currentTextArea: HTMLTextAreaElement | undefined;
   key: string;
   setFullText: (value: string) => void;
+  extraModels?: { displayName: string; modelKey: string }[];
 }) {
+  // State to hold the user's chat model input
+  const [customChatModel, setCustomChatModel] = useState("");
+  // State to hold the user's completion model input
+  const [customCompletionModel, setCustomCompletionModel] = useState("");
+
+  // Function to update the state as the user types in the textbox
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const handleChatModelChange = (event: any) => {
+    setCustomChatModel(event.target.value);
+  };
+
+  // Function to update the state as the user types in the textbox
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const handleCompletionModelChange = (event: any) => {
+    setCustomCompletionModel(event.target.value);
+  };
+
+  const initialExtraModelsDisplayNames =
+    props.extraModels?.map((model) => model.displayName) ?? [];
+  const allModelsDisplayNames = ALL_MODELS.map((model) =>
+    typeof model === "string" ? model : model.displayName
+  );
+  const [allModels, setAllModels] = useState([
+    ...(props.extraModels ? initialExtraModelsDisplayNames : []),
+    ...allModelsDisplayNames,
+  ]);
+
+  useEffect(() => {
+    const extraModelsDisplayNames =
+      props.extraModels?.map((model) => model.displayName) ?? [];
+    setAllModels([
+      ...(props.extraModels ? extraModelsDisplayNames : []),
+      ...allModelsDisplayNames,
+    ]);
+  }, [props.extraModels, allModelsDisplayNames]);
+
   return (
     <div key={props.key}>
       <div>
-        {ALL_MODELS.map((model) => (
-          <button key={model} onClick={() => props.streamCompletion(model)}>
+        {allModels.map((model) => (
+          <button
+            key={model}
+            onClick={() => {
+              props.abortController?.abort();
+              const maybeModel =
+                props.extraModels?.find(
+                  (modelObj) => modelObj.displayName === model
+                ) ??
+                (ALL_MODELS.find(
+                  (modelObj) =>
+                    typeof modelObj !== "string" &&
+                    modelObj.displayName === model
+                ) as { displayName: string; modelKey: string } | undefined);
+              if (maybeModel) {
+                props.streamCompletion(maybeModel.modelKey);
+              } else {
+                props.streamCompletion(model);
+              }
+            }}
+          >
             Submit to {model}
           </button>
         ))}
+        <input
+          type="text"
+          value={customChatModel}
+          onChange={handleChatModelChange}
+          placeholder="Enter your chat model"
+        />
+        <button onClick={() => props.streamCompletion(customChatModel)}>
+          Submit to {customChatModel}
+        </button>
         {props.abortController !== undefined && (
           <>
             <button
               onClick={() => {
                 props.abortController?.abort();
-                props.setAbortController(undefined);
               }}
             >
               Cancel
@@ -1782,6 +2659,21 @@ function AssistantBox(props: {
               Submit to {model}
             </button>
           ))}
+          <input
+            type="text"
+            value={customCompletionModel}
+            onChange={handleCompletionModelChange}
+            placeholder="Enter your completion model"
+          />
+          <button
+            onClick={() =>
+              props.streamCompletion(customCompletionModel, {
+                completionModel: true,
+              })
+            }
+          >
+            Submit to {customCompletionModel}
+          </button>
           {props.abortController !== undefined && (
             <>
               <button

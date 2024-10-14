@@ -1,19 +1,30 @@
-import { ChatCompletionResponseMessage } from "openai";
 import * as Priompt from "./lib";
-import { BasePromptProps, PromptElement, PromptProps } from "./types";
+import {
+  BasePromptProps,
+  Capture,
+  ChatAssistantFunctionToolCall,
+  ImageProps,
+  OutputHandler,
+  PromptElement,
+  PromptProps,
+} from "./types";
 import { JSONSchema7 } from "json-schema";
+import { ChatCompletionResponseMessage } from "openai";
 import { z } from "zod";
 import zodToJsonSchemaImpl from "zod-to-json-schema";
+import { StreamChatCompletionResponse } from "./openai";
 
 export function SystemMessage(
   props: PromptProps<{
     name?: string;
+    to?: string;
   }>
 ): PromptElement {
   return {
     type: "chat",
     role: "system",
     name: props.name,
+    to: props.to,
     children:
       props.children !== undefined
         ? Array.isArray(props.children)
@@ -26,12 +37,14 @@ export function SystemMessage(
 export function UserMessage(
   props: PromptProps<{
     name?: string;
+    to?: string;
   }>
 ): PromptElement {
   return {
     type: "chat",
     role: "user",
     name: props.name,
+    to: props.to,
     children:
       props.children !== undefined
         ? Array.isArray(props.children)
@@ -47,12 +60,20 @@ export function AssistantMessage(
       name: string;
       arguments: string; // json string
     };
+    toolCalls?: {
+      id: string;
+      index: number;
+      tool: ChatAssistantFunctionToolCall;
+    }[];
+    to?: string;
   }>
 ): PromptElement {
   return {
     type: "chat",
     role: "assistant",
     functionCall: props.functionCall,
+    toolCalls: props.toolCalls,
+    to: props.to,
     children:
       props.children !== undefined
         ? Array.isArray(props.children)
@@ -62,15 +83,26 @@ export function AssistantMessage(
   };
 }
 
+export function ImageComponent(props: PromptProps<ImageProps>): PromptElement {
+  return {
+    type: "image",
+    bytes: props.bytes,
+    dimensions: props.dimensions,
+    detail: props.detail,
+  };
+}
+
 export function FunctionMessage(
   props: PromptProps<{
     name: string;
+    to?: string;
   }>
 ): PromptElement {
   return {
     type: "chat",
     role: "function",
     name: props.name,
+    to: props.to,
     children:
       props.children !== undefined
         ? Array.isArray(props.children)
@@ -78,6 +110,276 @@ export function FunctionMessage(
           : [props.children]
         : [],
   };
+}
+
+export function ToolResultMessage(
+  props: PromptProps<{
+    name: string;
+    to?: string;
+  }>
+): PromptElement {
+  return {
+    type: "chat",
+    role: "tool",
+    name: props.name,
+    to: props.to,
+    children:
+      props.children !== undefined
+        ? Array.isArray(props.children)
+          ? props.children.flat()
+          : [props.children]
+        : [],
+  };
+}
+
+const populateOnStreamResponseObjectFromOnStream = (
+  captureProps: Capture & {
+    onStream: (
+      stream: AsyncIterable<ChatCompletionResponseMessage>
+    ) => Promise<void>;
+  }
+) => ({
+  ...captureProps,
+  onStreamResponseObject: async (
+    stream: AsyncIterable<StreamChatCompletionResponse>
+  ) => {
+    const messageStream = (async function* () {
+      for await (const s of stream) {
+        if (s.choices.length === 0) continue;
+        if (s.choices[0].delta === undefined) continue;
+        const message = s.choices[0].delta;
+        yield message;
+      }
+    })();
+    await captureProps.onStream(messageStream);
+  },
+});
+
+// design choice: can only have 1 tools component per prompt, and cannot have any other onStream
+export function Tools(
+  props: PromptProps<{
+    tools: {
+      name: string;
+      description: string;
+      parameters: JSONSchema7;
+      onCall?: (
+        args: string,
+        toolCallId: string,
+        toolName: string,
+        toolIndex: number
+      ) => Promise<void>;
+      onFormatAndYield?: (
+        args: string,
+        toolCallId: string,
+        toolName: string,
+        toolIndex: number
+      ) => Promise<string>;
+    }[];
+    onReturn: OutputHandler<AsyncIterable<string>>;
+  }>
+): PromptElement {
+  return (
+    <>
+      {props.tools.map((tool) => (
+        // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+        // @ts-ignore
+        <Tool
+          name={tool.name}
+          description={tool.description}
+          parameters={tool.parameters}
+        />
+      ))}
+      {populateOnStreamResponseObjectFromOnStream({
+        type: "capture",
+        onStream: async (
+          stream: AsyncIterable<ChatCompletionResponseMessage>
+        ) => {
+          await props.onReturn(
+            (async function* () {
+              // index -> {name, args}
+              const toolCallsMap = new Map<
+                number,
+                { name: string; args: string; toolCallId: string }
+              >();
+              for await (const message of stream) {
+                if (message.content !== undefined) {
+                  yield message.content;
+                }
+                // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+                // @ts-ignore
+                const toolCalls = message.tool_calls as any[];
+                if (!Array.isArray(toolCalls)) {
+                  continue;
+                }
+                for (const toolCall of toolCalls) {
+                  const { index, id } = toolCall;
+                  let toolInfo = toolCallsMap.get(index);
+                  if (toolInfo === undefined) {
+                    toolInfo = { name: "", args: "", toolCallId: id };
+                  }
+                  if (toolCall.function.name !== undefined) {
+                    toolInfo.name = toolCall.function.name;
+                  }
+                  if (toolCall.function.arguments !== undefined) {
+                    toolInfo.args += toolCall.function.arguments;
+
+                    const tool = props.tools.find(
+                      (tool) => tool.name === toolInfo?.name
+                    );
+                    if (
+                      tool !== undefined &&
+                      tool.onFormatAndYield !== undefined
+                    ) {
+                      // try parsing as JSON, if successful, yield the parsed JSON
+                      try {
+                        const parsedArgs = JSON.parse(toolInfo.args);
+                        yield tool.onFormatAndYield(
+                          toolInfo.args,
+                          toolInfo.toolCallId,
+                          toolInfo.name,
+                          index
+                        );
+                      } catch (error) {
+                        // do nothing
+                      }
+                    }
+                  }
+                  toolCallsMap.set(index, toolInfo);
+                }
+              }
+              for (const [toolIndex, toolInfo] of toolCallsMap.entries()) {
+                if (
+                  toolInfo.name !== undefined &&
+                  toolInfo.args !== undefined
+                ) {
+                  const tool = props.tools.find(
+                    (tool) => tool.name === toolInfo.name
+                  );
+                  if (tool !== undefined && tool.onCall !== undefined) {
+                    await tool.onCall(
+                      toolInfo.args,
+                      toolInfo.toolCallId,
+                      toolInfo.name,
+                      toolIndex
+                    );
+                  }
+                }
+              }
+            })()
+          );
+        },
+      })}
+    </>
+  );
+}
+
+export function ZTools<ParamT>(
+  props: PromptProps<{
+    tools: {
+      name: string;
+      description: string;
+      parameters: z.ZodType<ParamT>;
+      onCall?: (
+        args: ParamT,
+        toolCallId: string,
+        toolName: string,
+        toolIndex: number
+      ) => Promise<void>;
+      onParseError?: (error: z.ZodError, rawArgs: string) => Promise<void>;
+      onFormatAndYield?: (
+        args: ParamT,
+        toolCallId: string,
+        toolName: string,
+        toolIndex: number
+      ) => Promise<string>;
+    }[];
+    onReturn: OutputHandler<AsyncIterable<string>>;
+    useAnthropic?: boolean;
+  }>
+): PromptElement {
+  return (
+    // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+    // @ts-ignore
+    <Tools
+      tools={props.tools.map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        parameters: zodToJsonSchema(tool.parameters),
+        onCall: async (
+          args: string,
+          toolCallId: string,
+          toolName: string,
+          toolIndex: number
+        ) => {
+          try {
+            const parsedArgs = tool.parameters.parse(JSON.parse(args));
+            await tool.onCall?.(parsedArgs, toolCallId, toolName, toolIndex);
+          } catch (error) {
+            console.error(
+              `Error parsing arguments for tool ${tool.name}:`,
+              error
+            );
+            if (tool.onParseError !== undefined) {
+              await tool.onParseError(error, args);
+            } else {
+              throw error;
+            }
+          }
+        },
+        onFormatAndYield: tool.onFormatAndYield
+          ? async (
+              args: string,
+              toolCallId: string,
+              toolName: string,
+              toolIndex: number
+            ) => {
+              try {
+                const parsedArgs = tool.parameters.parse(JSON.parse(args));
+                return (
+                  tool.onFormatAndYield?.(
+                    parsedArgs,
+                    toolCallId,
+                    toolName,
+                    toolIndex
+                  ) ?? args
+                );
+              } catch (error) {
+                console.error(
+                  `Error formatting arguments for tool ${tool.name}:`,
+                  error
+                );
+                return args;
+              }
+            }
+          : undefined,
+      }))}
+      onReturn={props.onReturn}
+    />
+  );
+}
+
+function Tool(
+  props: PromptProps<{
+    name: string;
+    description: string;
+    parameters: JSONSchema7;
+  }>
+): PromptElement {
+  return (
+    <>
+      {{
+        type: "toolDefinition",
+        tool: {
+          type: "function",
+          function: {
+            name: props.name,
+            description: props.description,
+            parameters: props.parameters,
+          },
+        },
+      }}
+    </>
+  );
 }
 
 export function Function(

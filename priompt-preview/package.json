@@ -1,7 +1,7 @@
 {
   "name": "@anysphere/priompt-preview",
   "license": "MIT",
-  "version": "0.1.1",
+  "version": "0.2.1",
   "description": "An interactive preview of priompt prompts.",
   "repository": {
     "type": "git",
@@ -13,7 +13,6 @@
   "scripts": {
     "dev": "vite",
     "build": "wireit",
-    "publish-to-npm": "pnpm build && pnpm publish --access=public",
     "build-watch": "nodemon --watch 'src/**/*' --ext '*' --exec 'pnpm build'",
     "lint": "wireit",
     "tsc-build": "wireit",
@@ -24,7 +23,8 @@
     "build": {
       "command": "vite build",
       "files": [
-        "src/**/*",
+        "src/**/*.ts",
+        "src/**/*.tsx",
         "tsconfig.json"
       ],
       "output": [
@@ -32,13 +32,15 @@
       ],
       "clean": "if-file-deleted",
       "dependencies": [
-        "tsc-build"
+        "priompt:build"
       ]
     },
     "tsc-build": {
       "command": "tsc --build --pretty",
+      "clean": "if-file-deleted",
       "files": [
-        "src/**/*",
+        "src/**/*.ts",
+        "src/**/*.tsx",
         "tsconfig.json"
       ],
       "output": [
@@ -46,8 +48,7 @@
       ],
       "dependencies": [
         "priompt:build"
-      ],
-      "clean": "if-file-deleted"
+      ]
     },
     "priompt:build": {
       "command": "pnpm i",
@@ -80,10 +81,10 @@
     "lucide-react": "^0.263.1",
     "tailwind-merge": "^1.14.0",
     "tailwindcss-animate": "^1.0.6",
-    "uuid": "^9.0.0"
+    "uuid": "^9.0.0",
+    "@anysphere/priompt": "workspace:*"
   },
   "devDependencies": {
-    "@anysphere/priompt": "workspace:*",
     "@types/react": "^18.0.28",
     "@types/react-dom": "^18.0.11",
     "@types/uuid": "^9.0.1",

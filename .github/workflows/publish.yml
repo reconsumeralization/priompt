@@ -1,0 +1,145 @@
+name: Publish
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, publish]
+  pull_request:
+
+env:
+  DEBUG: "napi:*"
+  MACOSX_DEPLOYMENT_TARGET: "10.13"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tiktoken-node
+    strategy:
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+          - aarch64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Node
+        uses: actions/setup-node@v3
+        with:
+          node-version: 20.12.2
+
+      - uses: anysphere/action-setup@0eb0e970826653e8af98de91bec007fbd58a23e0
+        name: Install pnpm
+        id: pnpm-install
+        with:
+          version: "=8.6.0"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Run init.sh
+        working-directory: .
+        run: ./init.sh
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install ziglang
+        uses: goto-bus-stop/setup-zig@v1
+        with:
+          version: 0.10.0
+
+      - run: cargo install cargo-xwin
+        if: matrix.target == 'x86_64-pc-windows-msvc' || matrix.target == 'aarch64-pc-windows-msvc'
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Node install
+        run: pnpm i
+
+      - name: Build Mac and Linux
+        if: matrix.target != 'x86_64-pc-windows-msvc' && matrix.target != 'x86_64-unknown-linux-gnu' && matrix.target != 'aarch64-pc-windows-msvc'
+        run: pnpm run build -- --zig --target ${{ matrix.target }}
+
+      - name: Build Windows
+        if: matrix.target == 'x86_64-pc-windows-msvc' || matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-pc-windows-msvc'
+        run: pnpm run build -- --target ${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: bindings-${{ matrix.target }}
+          path: tiktoken-node/tiktoken-node.*.node
+          if-no-files-found: error
+
+  publish:
+    if: ${{ github.repository == 'anysphere/priompt' && github.event_name == 'push' && github.ref == 'refs/heads/publish' }}
+    runs-on: ubuntu-20.04
+    needs: build
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Node
+        uses: actions/setup-node@v3
+        with:
+          node-version: 20.12.2
+
+      - uses: anysphere/action-setup@0eb0e970826653e8af98de91bec007fbd58a23e0
+        name: Install pnpm
+        id: pnpm-install
+        with:
+          version: "=8.6.0"
+
+      - name: Run init.sh
+        working-directory: .
+        run: ./init.sh
+
+      - name: Download build
+        uses: actions/download-artifact@v3
+        with:
+          path: tiktoken-node/artifacts
+
+      - name: LS artifacts
+        run: ls -R tiktoken-node/artifacts
+        shell: bash
+
+      - name: Move artifacts
+        working-directory: tiktoken-node
+        run: pnpm artifacts
+
+      - name: LS post-move
+        run: ls -R tiktoken-node/npm
+        shell: bash
+
+      - name: npm version
+        run: npm --version
+        shell: bash
+
+      - name: Build priompt
+        working-directory: priompt
+        run: pnpm build
+
+      - name: Build priompt-preview
+        working-directory: priompt-preview
+        run: pnpm build
+
+      - name: globally install napi-rs
+        run: npm install -g @napi-rs/cli
+
+      - name: Set publishing config
+        run: pnpm config set '//registry.npmjs.org/:_authToken' "${NODE_AUTH_TOKEN}"
+        env:
+          NODE_AUTH_TOKEN: ${{secrets.NPM_TOKEN}}
+
+      - name: Publish to npm
+        run: pnpm publish --recursive --access=public --no-git-checks

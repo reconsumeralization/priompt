@@ -1,9 +1,10 @@
 import { render } from './lib';
-import { Prompt, PromptElement, PromptProps, RenderOutput } from './types';
+import { PreviewConfig, Prompt, PromptElement, PromptProps, RenderOutput, SynchronousPreviewConfig, SynchronousPrompt } from './types';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as yaml from 'js-yaml';
 import { StreamChatCompletionResponse } from './openai';
+import { UsableTokenizer, getTokenizerByName_ONLY_FOR_OPENAI_TOKENIZERS } from './tokenizer';
 import { ChatCompletionResponseMessage, CreateChatCompletionResponse } from 'openai';
 import { NewOutputCatcher, OutputCatcher } from './outputCatcher.ai';
 
@@ -11,14 +12,30 @@ export type PreviewManagerGetPromptQuery = {
   promptId: string;
   propsId: string;
   tokenLimit: number;
+  tokenizer: UsableTokenizer;
+  shouldBuildSourceMap: boolean;
 };
+
+export type PreviewManagerGetRemotePromptQuery = {
+  promptId: string;
+  promptDump: string;
+  tokenLimit: number;
+  tokenizer: UsableTokenizer;
+};
+
+export type PreviewManagerGetRemotePropsQuery = {
+  promptId: string;
+  promptDump: string
+}
 
 export type PreviewManagerGetPromptOutputQuery = {
   promptId: string;
   propsId: string;
   tokenLimit: number;
+  tokenizer: UsableTokenizer;
   completion: ChatCompletionResponseMessage | ChatCompletionResponseMessage[];
   stream: boolean;
+  shouldBuildSourceMap: boolean;
 };
 
 export type PreviewManagerLiveModeQuery = {
@@ -36,6 +53,7 @@ export interface IPreviewManager {
   // these two methods need to be implemented on the server for priompt to work
   getPreviews(): Record<string, { dumps: string[], saved: string[] }>;
   getPrompt(query: PreviewManagerGetPromptQuery): Promise<RenderOutput>;
+  getPromptFromRemote(query: PreviewManagerGetRemotePromptQuery): Promise<RenderOutput>;
 }
 
 type LiveModeOutput = {
@@ -48,32 +66,82 @@ type LiveModeData = {
 };
 
 function getProjectRoot(): string {
+  if (process.env.PRIOMPT_PREVIEW_BASE_ABSOLUTE_PATH !== undefined) {
+    return process.env.PRIOMPT_PREVIEW_BASE_ABSOLUTE_PATH;
+  }
+  if (process.env.PRIOMPT_PREVIEW_BASE_RELATIVE_PATH !== undefined) {
+    return path.join(process.cwd(), process.env.PRIOMPT_PREVIEW_BASE_RELATIVE_PATH);
+  }
   // just do cwd / priompt for now
   return process.cwd();
 }
 
-export function configFromPrompt<T, ReturnT = never>(prompt: (props: PromptProps<T, ReturnT>) => PromptElement): PreviewConfig<T> {
+export function configFromPrompt<T, ReturnT = never>(prompt: Prompt<T, ReturnT>): PreviewConfig<T> {
+  if (prompt.config !== undefined) {
+    return prompt.config;
+  }
+
+  return {
+    id: prompt.name,
+    prompt,
+  };
+}
+export function configFromSynchronousPrompt<T, ReturnT = never>(prompt: SynchronousPrompt<T, ReturnT>, options?: {
+  protoProps?: ProtoPropsType<T>;
+}): SynchronousPreviewConfig<T, ReturnT> {
+  if (prompt.config !== undefined) {
+    return prompt.config;
+  }
+
   return {
     id: prompt.name,
     prompt,
   };
 }
 
-export function dumpProps<T, ReturnT = never>(config: PreviewConfig<T, ReturnT>, props: Omit<T, "onReturn">) {
+export function dumpProps<T, ReturnT = never>(config: PreviewConfig<T, ReturnT>, props: Omit<T, "onReturn">): string {
+  let hasNoDump = false;
+  for (const key in props) {
+    if (key.startsWith('DO_NOT_DUMP')) {
+      hasNoDump = true;
+    }
+  }
+  let objectToDump = props;
+  if (hasNoDump) {
+    objectToDump = {} as Omit<T, "onReturn">;
+    for (const key in props) {
+      if (!key.startsWith('DO_NOT_DUMP')) {
+        // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+        // @ts-ignore
+        objectToDump[key] = props[key];
+      }
+    }
+  }
+
   const dump = config.dump
-    ? config.dump(props)
-    : yaml.dump(props, {
-      indent: 2,
-      lineWidth: -1,
-    });
+    ? config.dump(objectToDump)
+    : defaultYamlDump(objectToDump);
   return dump;
 }
 
-export type PreviewConfig<PropsT, ReturnT = never> = {
-  id: string;
-  prompt: (props: PromptProps<PropsT, ReturnT>) => PromptElement;
-  // defaults to yaml but can be overridden
-  dump?: (props: Omit<PropsT, "onReturn">) => string; hydrate?: (dump: string) => PropsT;
+export function defaultYamlDump<T>(props: T): string {
+  // JSON is valid YAML, so yaml loads of this data will work fine.
+  // the YAML dump is synchronous and relatively slow, and JSON stringify is much faster.
+  return JSON.stringify(props, null, 2);
+}
+
+export function defaultYamlLoad<T>(dump: string): T {
+  // This has to load both yaml data (prior to 9-17-24) and json data (post 9-17-24)
+  // json is valid yaml so this will work, but yaml is not valid json, so a json load would not work.
+  return yaml.load(dump) as T;
+}
+
+// protoprops have a custom from-json/to-json!
+export type ProtoPropsType<T> = {
+  fromJsonString(jsonString: string): T;
+}
+export type ProtoProps = {
+  toJsonString(): string;
 }
 
 class PreviewManagerImpl implements IPreviewManager {
@@ -89,6 +157,10 @@ class PreviewManagerImpl implements IPreviewManager {
   }
 
   private readonly previews: Record<string, PreviewConfig<unknown>> = {};
+
+  getConfig(promptId: string) {
+    return this.previews[promptId];
+  }
 
   getPreviews() {
     return Object.keys(this.previews).reduce((acc: Record<string, { dumps: string[], saved: string[] }>, promptId) => {
@@ -114,9 +186,12 @@ class PreviewManagerImpl implements IPreviewManager {
   }
 
   async getPrompt(query: PreviewManagerGetPromptQuery): Promise<RenderOutput> {
-    const element = PreviewManager.getElement(query.promptId, query.propsId);
+    let element = PreviewManager.getElement(query.promptId, query.propsId);
+    if (element instanceof Promise) {
+      element = await element;
+    }
 
-    const rendered = await render(element, { model: "gpt-4", tokenLimit: query.tokenLimit });
+    const rendered = await render(element, { tokenizer: getTokenizerByName_ONLY_FOR_OPENAI_TOKENIZERS(query.tokenizer), tokenLimit: query.tokenLimit, shouldBuildSourceMap: query.shouldBuildSourceMap });
 
     return rendered;
   }
@@ -124,9 +199,12 @@ class PreviewManagerImpl implements IPreviewManager {
   async getPromptOutput(query: PreviewManagerGetPromptOutputQuery): Promise<unknown> {
     const outputCatcher = NewOutputCatcher<unknown>();
 
-    const element = PreviewManager.getElement(query.promptId, query.propsId, outputCatcher);
+    let element = PreviewManager.getElement(query.promptId, query.propsId, outputCatcher);
+    if (element instanceof Promise) {
+      element = await element;
+    }
 
-    const rendered = await render(element, { model: "gpt-4", tokenLimit: query.tokenLimit });
+    const rendered = await render(element, { tokenizer: getTokenizerByName_ONLY_FOR_OPENAI_TOKENIZERS(query.tokenizer), tokenLimit: query.tokenLimit, shouldBuildSourceMap: query.shouldBuildSourceMap });
 
     if (!query.stream) {
       // call all of them and wait all of them in parallel
@@ -162,7 +240,41 @@ class PreviewManagerImpl implements IPreviewManager {
 
   }
 
-  private getElement(promptId: string, propsId: string, outputCatcher?: OutputCatcher<unknown>): PromptElement {
+  async getPromptFromRemote(query: PreviewManagerGetRemotePromptQuery) {
+    let element = this.getRemoteElement(query.promptId, query.promptDump);
+    if (element instanceof Promise) {
+      element = await element;
+    }
+    return this.getPromptFromRemoteElement(query, element);
+  }
+
+  async getPropsFromRemote(query: PreviewManagerGetRemotePropsQuery) {
+    const promptId = query.promptId;
+    const promptDump = query.promptDump;
+    const config = this.previews[promptId];
+    const baseProps = this.hydrate(config, promptDump);
+    return baseProps;
+  }
+  getPromptFunctionFromRemote(query: PreviewManagerGetRemotePropsQuery) {
+    const promptId = query.promptId;
+    const config = this.previews[promptId];
+    return config.prompt;
+  }
+
+  async getPromptFromRemoteElement(query: Omit<PreviewManagerGetRemotePromptQuery, "promptId" | "promptDump">, element: PromptElement) {
+    const rendered = await render(element, { tokenizer: getTokenizerByName_ONLY_FOR_OPENAI_TOKENIZERS(query.tokenizer), tokenLimit: query.tokenLimit });
+    return rendered
+  }
+
+  getRemoteElement(promptId: string, promptDump: string) {
+    const config = this.previews[promptId];
+    const baseProps = this.hydrate(config, promptDump);
+    const element = config.prompt(baseProps as PromptProps<unknown>);
+    return element;
+  }
+
+
+  getElement(promptId: string, propsId: string, outputCatcher?: OutputCatcher<unknown>): PromptElement | Promise<PromptElement> {
     if (promptId === 'liveModePromptId') {
       if (this.lastLiveModeData === null) {
         throw new Error('live mode prompt not found');
@@ -194,26 +306,53 @@ class PreviewManagerImpl implements IPreviewManager {
 
   registerConfig<T, ReturnT = never>(config: PreviewConfig<T, ReturnT>) {
     if (Object.keys(this.previews).includes(config.id)) {
-      throw new Error(`preview id ${config.id} already registered`);
+      // sort of sketchy, but may be fine if we're in esm hmr land...
+      // we just overwrite
+      if (process.env.ALLOW_PROMPT_REREGISTRATION === "true") {
+        console.warn(`preview id ${config.id} already registered`);
+      } else {
+        throw new Error(`preview id ${config.id} already registered`);
+      }
     }
+    if (config.prompt.config?.id !== undefined && config.prompt.config.id !== config.id && process.env.NODE_ENV === 'development') {
+      throw new Error(`Prompt id ${config.prompt.config.id} does not match config id ${config.id}. Prompts and configs need to be in a 1-to-1 mapping, because otherwise the serialization/deserialization of props becomes unclear and may cause bugs for you. (If you want to register an alias name for a prompt, just wrap the prompt in another prompt and register that one.)`);
+    }
+    config.prompt.config = config;
     this.previews[config.id] = config;
   }
   register<T, ReturnT = never>(prompt: Prompt<T, ReturnT>) {
     const config = configFromPrompt(prompt);
     this.registerConfig(config);
   }
+  registerProtoPrompt<T extends ProtoProps, ReturnT = never>(prompt: Prompt<T, ReturnT>, protoProps: ProtoPropsType<T>) {
+    const config = configFromPrompt(prompt);
+    config.dump = (props) => props.toJsonString();
+    config.hydrate = (dump) => {
+      try {
+        return protoProps.fromJsonString(dump)
+      } catch (e) {
+        // we try parsing as yaml! for backwards compatibility!
+        const jsonS = JSON.stringify(defaultYamlLoad(dump));
+        return protoProps.fromJsonString(jsonS);
+      }
+    };
+    this.registerConfig(config);
+  }
 
+  configFromSynchronousPrompt<T, ReturnT = never>(prompt: SynchronousPrompt<T, ReturnT>): SynchronousPreviewConfig<T, ReturnT> {
+    return configFromSynchronousPrompt(prompt);
+  }
 
-  private hydrate<T>(config: PreviewConfig<T>, dump: string): T {
+  hydrate<T>(config: PreviewConfig<T>, dump: string): T {
     if (config.hydrate) {
       return config.hydrate(dump);
     }
-    const yamlData = yaml.load(dump);
+    const yamlData = defaultYamlLoad(dump);
     const props: T = yamlData as T;
     return props;
   }
 
-  maybeDump<T, ReturnT = never>(prompt: (props: PromptProps<T, ReturnT>) => PromptElement, props: Omit<T, "onReturn">) {
+  maybeDump<T, ReturnT = never>(prompt: Prompt<T, ReturnT>, props: Omit<T, "onReturn">) {
     if (!this.shouldDump) {
       return;
     }
@@ -224,7 +363,6 @@ class PreviewManagerImpl implements IPreviewManager {
   dump<T>(config: PreviewConfig<T>, props: T) {
     const dump = dumpProps(config, props);
     const priomptPath = path.join(getProjectRoot(), 'priompt', config.id);
-    console.log("PRIOMPT PATH: ", priomptPath);
     const dumpsPath = path.join(priomptPath, 'dumps');
 
     if (!fs.existsSync(priomptPath)) {
@@ -238,6 +376,19 @@ class PreviewManagerImpl implements IPreviewManager {
 
     if (!fs.existsSync(dumpsPath)) {
       fs.mkdirSync(dumpsPath, { recursive: true });
+    }
+
+    // if there are more than 2000 files, delete the oldest 1000 of them
+    try {
+      const files = fs.readdirSync(dumpsPath);
+      if (files.length > 2000) {
+        const sortedFiles = files.sort((a, b) => a.localeCompare(b));
+        for (let i = 0; i < 1000; i++) {
+          fs.unlinkSync(path.join(dumpsPath, sortedFiles[i]));
+        }
+      }
+    } catch (e) {
+      console.warn({ error: e }, "failed to remove old priompt dumps")
     }
 
     const propsId = new Date().toISOString().replace(/[:.]/g, '-'); // Human-readable propsId with date and time
@@ -363,13 +514,6 @@ export function register() {
   }
   return registerPrompt;
 }
-
-// export function register<T, ReturnT = never>(prompt: Prompt<T, ReturnT>) {
-//   PreviewManager.register(prompt);
-// }
-
-
-
 
 
 function randomString() {

@@ -1,10 +1,9 @@
-import { ChatCompletionRequestMessage, CreateChatCompletionRequest, CreateCompletionRequest, CreateCompletionResponse, StreamChatCompletionResponse } from './openai_interfaces';
+import { ChatCompletionRequestMessage, CreateChatCompletionRequest, CreateCompletionRequest, CreateCompletionResponse, StreamChatCompletionResponse } from '@anysphere/priompt/dist/openai';
 import { encodingForModel } from "js-tiktoken";
 
 
-const API_KEY = 'PRIOMPT_PREVIEW_OPENAI_KEY';
 
-export async function* streamChat(createChatCompletionRequest: CreateChatCompletionRequest, options?: RequestInit, abortSignal?: AbortSignal): AsyncGenerator<StreamChatCompletionResponse> {
+export async function* streamChatLocalhost(createChatCompletionRequest: CreateChatCompletionRequest, options?: RequestInit, abortSignal?: AbortSignal) {
 	let streamer: AsyncGenerator<StreamChatCompletionResponse> | undefined = undefined;
 
 	const newAbortSignal = new AbortController();
@@ -13,28 +12,41 @@ export async function* streamChat(createChatCompletionRequest: CreateChatComplet
 	});
 
 	let timeout = setTimeout(() => {
-		console.error("OpenAI request timed out after 40 seconds..... Not good.")
+		console.error("OpenAI request timed out after 200 seconds..... Not good.")
 		// Next, we abort the signal
 		newAbortSignal.abort();
-	}, 40_000);
+	}, 200_000);
 
 	try {
+		const prompt = joinMessages(createChatCompletionRequest.messages, true);
+		let tokens = enc.encode(prompt).length;
+		if (createChatCompletionRequest.model.includes('00')) {
+			tokens = enc_old.encode(prompt).length;
+		}
+		const maxTokens = Math.min((getTokenLimit(createChatCompletionRequest.model)) - tokens, getOutputTokenLimit(createChatCompletionRequest.model))
 		const requestOptions: RequestInit = {
 			...options,
 			method: 'POST',
 			headers: {
-				...options?.headers,
-				'Authorization': `Bearer ${API_KEY}`,
 				'Content-Type': 'application/json',
 			},
 			signal: newAbortSignal.signal,
 			body: JSON.stringify({
 				...createChatCompletionRequest,
-				stream: true
+				...(
+					openaiNonStreamableModels.includes(createChatCompletionRequest.model) ? {
+						stream: undefined,
+						max_tokens: undefined,
+					} : {
+						stream: true,
+						max_tokens: maxTokens
+					}
+				)
 			}),
 		};
 
-		const response = await fetch('https://api.openai.com/v1/chat/completions', requestOptions);
+		// const url = getBaseUrl(createChatCompletionRequest.model) + '/chat/completions';
+		const response = await fetch('http://localhost:8000/priompt/chat/completions', requestOptions);
 		if (!response.ok) {
 			throw new Error(`HTTP error! status: ${response.status}. message: ${await response.text()}`);
 		}
@@ -61,33 +73,72 @@ export async function* streamChat(createChatCompletionRequest: CreateChatComplet
 	}
 }
 
+const getOutputTokenLimit = (model: string) => {
+	if (model.includes('22b')) {
+		return 32_768;
+	} else if (model.includes("claude-3-5-sonnet-20240620")) {
+		return 8_192;
+	} else {
+		return 4_096;
+	}
+}
+
+const getTokenLimit = (model: string) => {
+	const maybeTokenLimit = TOKEN_LIMIT[model];
+	if (maybeTokenLimit !== undefined) {
+		return maybeTokenLimit;
+	}
+
+	if (model.includes('22b')) {
+		return 32_768;
+	}
+
+	return 1_000_000;
+}
+
 const TOKEN_LIMIT: Record<string, number> = {
 	"gpt-3.5-turbo": 4096,
 	"azure-3.5-turbo": 4096,
 	"gpt-4": 8192,
-	"gpt-4-cursor-completions": 8192,
+	"gpt-4-cursor-completions": 128_000,
+	"gpt-4-cursor-vinod": 128_000,
 	"gpt-4-0314": 8192,
 	"gpt-4-32k": 32000,
+	"gpt-4-1106-preview": 128000,
+	"gpt-4-0125-preview": 128000,
+	"gpt-3.5-turbo-1106": 16000,
 	"text-davinci-003": 4096,
 	"code-davinci-002": 4096,
 };
 const enc = encodingForModel("gpt-4");
 const enc_old = encodingForModel("text-davinci-003");
 
+const openaiNonStreamableModels = ["o1-mini-2024-09-12", "o1-preview-2024-09-12"];
 
-export async function* streamChatCompletion(createChatCompletionRequest: CreateChatCompletionRequest, options?: RequestInit, abortSignal?: AbortSignal): AsyncGenerator<StreamChatCompletionResponse> {
+// TODO (Aman): Make this work for non-oai models (or error if it doesn't work for them)!
+export async function* streamChatCompletionLocalhost(createChatCompletionRequest: CreateChatCompletionRequest, options?: RequestInit, abortSignal?: AbortSignal): AsyncGenerator<StreamChatCompletionResponse> {
+	// If this is an anthropic or fireworks model, we can streamchat having partially filled in the last assistant message
+	if (createChatCompletionRequest.model.includes('claude-3') || createChatCompletionRequest.model.includes('deepseek')) {
+		// The last message must be an assistant message
+		if (createChatCompletionRequest.messages.length === 0 || createChatCompletionRequest.messages[createChatCompletionRequest.messages.length - 1].role !== 'assistant') {
+			throw new Error('Last message must not be an assistant message');
+		}
+		yield* streamChatLocalhost(createChatCompletionRequest, options, abortSignal);
+		return;
+	}
 	const prompt = joinMessages(createChatCompletionRequest.messages, true);
 	let tokens = enc.encode(prompt).length;
 	if (createChatCompletionRequest.model.includes('00')) {
 		tokens = enc_old.encode(prompt).length;
 	}
 	const createCompletionRequest = {
-		max_tokens: (TOKEN_LIMIT[createChatCompletionRequest.model] ?? 4096) - tokens,
+		max_tokens: Math.min((getTokenLimit(createChatCompletionRequest.model)) - tokens, getOutputTokenLimit(createChatCompletionRequest.model)), // hacky but most models only support 4k output tokens
 		...createChatCompletionRequest,
 		messages: undefined,
 		prompt,
 		stop: ['<|im_end|>', '<|diff_marker|>']
 	} as CreateCompletionRequest;
+
 
 	let streamer: AsyncGenerator<CreateCompletionResponse> | undefined = undefined;
 
@@ -97,17 +148,15 @@ export async function* streamChatCompletion(createChatCompletionRequest: CreateC
 	});
 
 	let timeout = setTimeout(() => {
-		console.error("OpenAI request timed out after 40 seconds..... Not good.")
+		console.error("OpenAI request timed out after 200 seconds..... Not good.")
 		newAbortSignal.abort();
-	}, 40_000);
+	}, 200_000);
 
 	try {
 		const requestOptions: RequestInit = {
 			...options,
 			method: 'POST',
 			headers: {
-				...options?.headers,
-				'Authorization': `Bearer ${API_KEY}`,
 				'Content-Type': 'application/json',
 			},
 			signal: newAbortSignal.signal,
@@ -117,7 +166,7 @@ export async function* streamChatCompletion(createChatCompletionRequest: CreateC
 			}),
 		};
 
-		const response = await fetch('https://api.openai.com/v1/completions', requestOptions);
+		const response = await fetch('http://localhost:8000/priompt/completions', requestOptions);
 		if (!response.ok) {
 			throw new Error(`HTTP error! status: ${response.status}. message: ${await response.text()}`);
 		}
@@ -204,12 +253,23 @@ async function* streamSource<T>(stream: ReadableStream): AsyncGenerator<T> {
 	}
 }
 
-export function joinMessages(messages: ChatCompletionRequestMessage[], lastIsIncomplete: boolean = false) {
-	return messages.map((message, index) => {
-		let ret = `<|im_start|>${message.role}<|im_sep|>${message.content}`;
-		if (!lastIsIncomplete || index !== messages.length - 1) {
-			ret += `<|im_end|>`;
+export function joinMessages(messages: ChatCompletionRequestMessage[], lastIsIncomplete: boolean = false, isLlama: boolean = false) {
+	if (!isLlama) {
+		return messages.map((message, index) => {
+			let ret = `<|im_start|>${message.role}<|im_sep|>${message.content}`;
+			if (!lastIsIncomplete || index !== messages.length - 1) {
+				ret += `<|im_end|>`;
+			}
+			return ret;
+		}).join('');
+	} else {
+		let ret = '<|begin_of_text|>'
+		for (const [index, message] of messages.entries()) {
+			ret += `<|start_header_id|>${message.role}<|end_header_id|>${message.content}`;
+			if (!lastIsIncomplete || index !== messages.length - 1) {
+				ret += `<|eot_id|>`;
+			}
 		}
 		return ret;
-	}).join('');
+	}
 }
